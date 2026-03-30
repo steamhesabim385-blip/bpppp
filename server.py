@@ -9,22 +9,66 @@ PyKeySystem v2 - Gelişmiş Key Auth Sistemi
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
-import sqlite3, hashlib, hmac, secrets, string, time, uuid, os, json, pathlib
+import hashlib, hmac, secrets, string, time, uuid, os, json, pathlib
 from contextlib import asynccontextmanager
 import uvicorn
 
-DATA_DIR = pathlib.Path(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "."))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = str(DATA_DIR / "keyauth.db")
+# ─── DB (PostgreSQL or SQLite fallback) ──────────────────────────────────────
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+if DATABASE_URL:
+    import psycopg2, psycopg2.extras
+    _USE_PG = True
+else:
+    import sqlite3
+    _USE_PG = False
+    DATA_DIR = pathlib.Path(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "."))
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DB_PATH = str(DATA_DIR / "keyauth.db")
+
+class _PgConn:
+    """psycopg2 wrapper that mimics the sqlite3 connection interface."""
+    def __init__(self):
+        self._conn = psycopg2.connect(DATABASE_URL)
+        self._cur  = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    def execute(self, sql, params=()):
+        sql = sql.replace("?", "%s")
+        if "INSERT OR IGNORE INTO" in sql:
+            sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO", 1)
+            sql = sql.rstrip() + " ON CONFLICT DO NOTHING"
+        self._cur.execute(sql, params if params else None)
+        return self._cur
+    def cursor(self):
+        return self._cur
+    def commit(self):
+        self._conn.commit()
+    def close(self):
+        try: self._cur.close()
+        except: pass
+        try: self._conn.close()
+        except: pass
+
+class _SqliteConn:
+    """Thin sqlite3 wrapper with the same interface as _PgConn."""
+    def __init__(self):
+        self._conn = sqlite3.connect(DB_PATH)
+        self._conn.row_factory = sqlite3.Row
+    def execute(self, sql, params=()):
+        return self._conn.execute(sql, params)
+    def cursor(self):
+        return self._conn.cursor()
+    def commit(self):
+        self._conn.commit()
+    def close(self):
+        self._conn.close()
 
 # ─── DB ───────────────────────────────────────────────────────────────────────
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return _PgConn() if _USE_PG else _SqliteConn()
 
 def init_db():
     conn = get_db(); c = conn.cursor()
+    logs_id_col = "id SERIAL PRIMARY KEY" if _USE_PG else "id INTEGER PRIMARY KEY AUTOINCREMENT"
     c.execute("""CREATE TABLE IF NOT EXISTS admins (
         owner_id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE,
         password TEXT NOT NULL, created_at INTEGER NOT NULL)""")
@@ -55,8 +99,8 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT PRIMARY KEY, app_id TEXT NOT NULL,
         secret TEXT NOT NULL, created_at INTEGER NOT NULL)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+    c.execute(f"""CREATE TABLE IF NOT EXISTS logs (
+        {logs_id_col},
         app_id TEXT NOT NULL, username TEXT,
         action TEXT NOT NULL, message TEXT,
         ip TEXT, created_at INTEGER NOT NULL)""")
@@ -91,10 +135,11 @@ def get_ip(request: Request):
     return fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "unknown")
 
 def get_device_count(conn, app_id, license_key):
-    return conn.execute(
-        "SELECT COUNT(*) FROM devices WHERE app_id=? AND license_key=?",
+    row = conn.execute(
+        "SELECT COUNT(*) as cnt FROM devices WHERE app_id=? AND license_key=?",
         (app_id, license_key)
-    ).fetchone()[0]
+    ).fetchone()
+    return row["cnt"] if _USE_PG else row[0]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1018,7 +1063,8 @@ async def key_list(owner_id:str, app_id:str, page:int=1, limit:int=25):
     off = (page-1)*limit
     rows = conn.execute("SELECT * FROM licenses WHERE app_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
                         (app_id, limit, off)).fetchall()
-    total = conn.execute("SELECT COUNT(*) FROM licenses WHERE app_id=?", (app_id,)).fetchone()[0]
+    _r = conn.execute("SELECT COUNT(*) as cnt FROM licenses WHERE app_id=?", (app_id,)).fetchone()
+    total = _r["cnt"] if _USE_PG else _r[0]
     conn.close()
     return ok(keys=[dict(r) for r in rows], total=total)
 
@@ -1066,7 +1112,8 @@ async def user_list(owner_id:str, app_id:str, page:int=1, limit:int=25):
     off = (page-1)*limit
     rows = conn.execute("SELECT id,username,ip,level,banned,ban_reason,created_at,last_login,expires_at,license_key FROM users WHERE app_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
                         (app_id,limit,off)).fetchall()
-    total = conn.execute("SELECT COUNT(*) FROM users WHERE app_id=?", (app_id,)).fetchone()[0]
+    _r = conn.execute("SELECT COUNT(*) as cnt FROM users WHERE app_id=?", (app_id,)).fetchone()
+    total = _r["cnt"] if _USE_PG else _r[0]
     conn.close()
     return ok(users=[dict(r) for r in rows], total=total)
 
@@ -1119,12 +1166,13 @@ async def stats(owner_id:str, app_id:str):
     conn = get_db()
     if not conn.execute("SELECT 1 FROM apps WHERE id=? AND owner_id=?", (app_id,owner_id)).fetchone():
         conn.close(); return err("Yetki yok")
-    tk = conn.execute("SELECT COUNT(*) FROM licenses WHERE app_id=?", (app_id,)).fetchone()[0]
-    uk = conn.execute("SELECT COUNT(*) FROM licenses WHERE app_id=? AND used=1", (app_id,)).fetchone()[0]
-    bk = conn.execute("SELECT COUNT(*) FROM licenses WHERE app_id=? AND banned=1", (app_id,)).fetchone()[0]
-    tu = conn.execute("SELECT COUNT(*) FROM users WHERE app_id=?", (app_id,)).fetchone()[0]
-    bu = conn.execute("SELECT COUNT(*) FROM users WHERE app_id=? AND banned=1", (app_id,)).fetchone()[0]
-    td = conn.execute("SELECT COUNT(*) FROM devices WHERE app_id=?", (app_id,)).fetchone()[0]
+    def _cnt(sql, params): r=conn.execute(sql,params).fetchone(); return r["cnt"] if _USE_PG else r[0]
+    tk = _cnt("SELECT COUNT(*) as cnt FROM licenses WHERE app_id=?", (app_id,))
+    uk = _cnt("SELECT COUNT(*) as cnt FROM licenses WHERE app_id=? AND used=1", (app_id,))
+    bk = _cnt("SELECT COUNT(*) as cnt FROM licenses WHERE app_id=? AND banned=1", (app_id,))
+    tu = _cnt("SELECT COUNT(*) as cnt FROM users WHERE app_id=?", (app_id,))
+    bu = _cnt("SELECT COUNT(*) as cnt FROM users WHERE app_id=? AND banned=1", (app_id,))
+    td = _cnt("SELECT COUNT(*) as cnt FROM devices WHERE app_id=?", (app_id,))
     conn.close()
     return ok(keys=dict(total=tk,used=uk,unused=tk-uk,banned=bk),
               users=dict(total=tu,banned=bu), devices=dict(total=td))

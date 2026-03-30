@@ -317,7 +317,7 @@ const S = { oid:null, uname:null, apps:[], app:null, pg:'dash' }
 
 // ─── API ──────────────────────────────────────────────────────────────────────
 async function api(m,p,d){
-  const o={method:m,headers:{'Content-Type':'application/json'}}
+  const o={method:m,headers:{'Content-Type':'application/json'},cache:'no-store'}
   if(d) o.body=JSON.stringify(d)
   const r=await fetch(p,o); return r.json()
 }
@@ -877,7 +877,20 @@ async function createApp(){
   const name=V('an')?.trim(),ver=V('av')||'1.0',hwid=document.getElementById('ah')?.checked?1:0,dl=V('adl')||'1'
   if(!name) return toast('Uygulama adı gerekli','e')
   const r=await P('/admin/app/create',{owner_id:S.oid,name,version:ver,hwid_check:hwid,device_limit:+dl})
-  if(r.success){toast(`✓ "${name}" oluşturuldu`,'s');await loadApps();S.app=S.apps.find(a=>a.name===name);document.getElementById('app-sel').value=S.app?.id||'';go('code')}
+  if(r.success){
+    toast(`✓ "${name}" oluşturuldu`,'s')
+    await loadApps()
+    S.app=S.apps.find(a=>a.id===r.app_id)||S.apps.find(a=>a.name===name)
+    if(!S.app){
+      S.app={id:r.app_id,owner_id:S.oid,name:r.name,secret:r.secret,enabled:1,paused:0,hwid_check:hwid,device_limit:+dl,version:ver,created_at:Math.floor(Date.now()/1e3)}
+      S.apps.push(S.app)
+      const sel=document.getElementById('app-sel')
+      const o=document.createElement('option');o.value=S.app.id;o.textContent=S.app.name
+      sel.appendChild(o)
+    }
+    document.getElementById('app-sel').value=S.app.id
+    go('dash')
+  }
   else toast(r.message,'e')
 }
 
